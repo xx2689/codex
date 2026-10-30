@@ -1337,6 +1337,119 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_compact_v2_rebuilds_incremental_prefix_on_context_overflow() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let base_instructions = "session base instructions";
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_history_mode(ThreadHistoryMode::Paginated)
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_model_info_override("gpt-5.4", |model| {
+                model.use_responses_lite = true;
+            })
+            .with_config(|config| {
+                config.base_instructions = Some(base_instructions.to_string());
+                config
+                    .features
+                    .enable(Feature::IncrementalTools)
+                    .expect("enable incremental tools");
+                config.model_provider.request_max_retries = Some(0);
+                config.model_provider.stream_max_retries = Some(0);
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+
+    let responses_mock = responses::mount_response_sequence(
+        harness.server(),
+        vec![
+            responses::sse_response(responses::sse_completed("resp-oldest")),
+            responses::sse_response(responses::sse_completed("resp-recent")),
+            responses::sse_response(responses::sse_failed(
+                "resp-compact-overflow-tools",
+                "context_length_exceeded",
+                "compaction input exceeds the context window",
+            )),
+            responses::sse_response(responses::sse_failed(
+                "resp-compact-overflow-instructions",
+                "context_length_exceeded",
+                "compaction input exceeds the context window",
+            )),
+            responses::sse_response(responses::sse_failed(
+                "resp-compact-overflow-history",
+                "context_length_exceeded",
+                "compaction input exceeds the context window",
+            )),
+            responses::sse_response(responses::sse(vec![
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "RECOVERED_COMPACT_SUMMARY",
+                    }
+                }),
+                responses::ev_completed("resp-compact-recovered"),
+            ])),
+            responses::sse_response(responses::sse_completed("resp-after-compact")),
+        ],
+    )
+    .await;
+
+    for message in ["oldest turn", "recent turn"] {
+        codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: message.to_string(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        wait_for_turn_complete(&codex).await;
+    }
+
+    codex.submit(Op::Compact).await?;
+    wait_for_turn_complete(&codex).await;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "after compact".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_turn_complete(&codex).await;
+
+    let requests = responses_mock.requests();
+    assert_eq!(requests.len(), 7);
+    for request in &requests[2..=5] {
+        assert_eq!(request.inputs_of_type("additional_tools").len(), 1);
+        assert_eq!(
+            request
+                .message_input_texts("developer")
+                .iter()
+                .filter(|message| message.as_str() == base_instructions)
+                .count(),
+            1,
+            "each rebuilt compaction request should contain the base instructions once"
+        );
+    }
+    assert!(
+        requests[5]
+            .message_input_texts("user")
+            .iter()
+            .any(|message| message == "recent turn"),
+        "recovered compaction should preserve the latest user turn"
+    );
+    assert!(
+        requests[6]
+            .body_json()
+            .to_string()
+            .contains("RECOVERED_COMPACT_SUMMARY"),
+        "the next turn should continue from the recovered compaction"
+    );
+
+    Ok(())
+}
+
 #[test_case(false; "manual")]
 #[test_case(true; "automatic")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

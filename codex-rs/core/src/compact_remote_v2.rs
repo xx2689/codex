@@ -288,7 +288,7 @@ async fn run_remote_compaction_request_v2(
     step_context: &StepContext,
     prompt: &Prompt,
     responses_metadata: &CodexResponsesMetadata,
-    transport: CompactionRequestTransport<'_>,
+    transport: &mut CompactionRequestTransport<'_>,
 ) -> CodexResult<RemoteCompactionV2Output> {
     let turn_context = &step_context.turn;
     let client_session = match transport {
@@ -300,13 +300,13 @@ async fn run_remote_compaction_request_v2(
                 .await;
             let trace = InferenceTraceContext::disabled();
             // Replay the routing token without letting this request change foreground routing.
-            let turn_state = Arc::new(turn_state.map(OnceLock::from).unwrap_or_default());
+            let turn_state = Arc::new(turn_state.clone().map(OnceLock::from).unwrap_or_default());
             let http_executor = ResponsesHttpExecutor::new(&sess.services.model_client);
             let stream = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(CodexErr::TurnAborted),
                 stream = http_executor.stream_responses_http(
-                    &turn_state, auth_owner_generation, /*event_sender*/ None, prompt, &settings.model_info, &step_context.session_telemetry, effort,
+                    &turn_state, *auth_owner_generation, /*event_sender*/ None, prompt, &settings.model_info, &step_context.session_telemetry, effort,
                     settings.reasoning_summary, settings.service_tier.clone(), responses_metadata,
                     &trace,
                 ) => stream?,
@@ -319,7 +319,7 @@ async fn run_remote_compaction_request_v2(
             )
             .await;
         }
-        CompactionRequestTransport::Foreground(client_session) => client_session,
+        CompactionRequestTransport::Foreground(client_session) => &mut **client_session,
     };
     let settings = &turn_context.initial_settings;
     let max_retries = turn_context

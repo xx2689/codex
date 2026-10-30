@@ -12,6 +12,7 @@ use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact_remote_history::trim_function_call_history_to_fit_context_window;
+use crate::context::BaseInstructionsFragment;
 use crate::context::world_state::WorldState;
 use crate::context_manager::ContextManager;
 use crate::context_manager::replace_unresolvable_image_files;
@@ -25,6 +26,7 @@ use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
 use codex_history::CodexHarnessMetadata;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
@@ -33,6 +35,7 @@ use codex_protocol::protocol::TokenUsage;
 use codex_rollout_trace::CompactionTraceContext;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+use tracing::warn;
 
 pub(super) struct RemoteCompactV2Attempt {
     pub(super) input_goal_ids: HashSet<ResponseItemId>,
@@ -80,17 +83,28 @@ pub(super) async fn run_remote_compact_v2_attempt(
     let (
         model_info,
         input_goal_ids,
-        trace_input_history,
-        base_instructions,
-        mut input,
-        prompt_input_metadata,
-        transport,
+        mut trace_input_history,
+        fallback_instructions,
+        mut background_input,
+        mut background_input_metadata,
+        mut transport,
         captured_window,
+        mut foreground_history,
     ) = match input {
         RemoteCompactV2AttemptInput::Foreground(client_session) => {
             let model_info = turn_context.model_info();
             let mut history = sess.clone_history().await;
             let input_goal_ids = UserGoalUpdate::message_ids(history.raw_items());
+            let mut fallback_instructions = sess.get_prompt_base_instructions().await;
+            if let Some(text) = history
+                .raw_items()
+                .find_map(BaseInstructionsFragment::text_from_item)
+            {
+                fallback_instructions.text = text.to_owned();
+            } else if history.has_tool_declarations() {
+                // An incremental window has no recorded base item when its instructions are empty.
+                fallback_instructions.text.clear();
+            }
             let tools_in_history = step_context.settings.model_info.use_responses_lite
                 && history
                     .raw_items()
@@ -101,7 +115,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
                     provenance: None,
                 }
             } else {
-                sess.get_prompt_base_instructions().await
+                fallback_instructions.clone()
             };
             let (rewritten_outputs, estimated_deleted_tokens) =
                 trim_function_call_history_to_fit_context_window(
@@ -131,18 +145,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
             let trace_input_history = compaction_trace
                 .is_enabled()
                 .then(|| history.raw_items().cloned().collect());
-            let (mut input, metadata): (Vec<_>, Vec<_>) = history
-                .for_prompt_annotated(
-                    &model_info.input_modalities,
-                    sess.services.image_store.as_ref(),
-                )
-                .await
-                .into_iter()
-                .map(|envelope| (envelope.item, envelope.metadata))
-                .unzip();
-            sess.services
-                .executed_tool_calls
-                .attach_to_compaction_prompt(&mut input);
             let client_session = client_session.unwrap_or_else(|| {
                 owned_client_session.insert(sess.services.model_client.new_session())
             });
@@ -150,11 +152,12 @@ pub(super) async fn run_remote_compact_v2_attempt(
                 model_info,
                 input_goal_ids,
                 trace_input_history,
-                base_instructions,
-                input,
-                metadata,
+                fallback_instructions,
+                Vec::new(),
+                Vec::new(),
                 CompactionRequestTransport::Foreground(client_session),
                 None,
+                Some(history),
             )
         }
         RemoteCompactV2AttemptInput::Background(input) => (
@@ -169,28 +172,10 @@ pub(super) async fn run_remote_compact_v2_attempt(
                 input.prefix.auth_owner_generation,
             ),
             Some(input.window),
+            None,
         ),
     };
-    let tools_in_history = model_info.use_responses_lite
-        && input
-            .iter()
-            .any(|item| matches!(item, ResponseItem::AdditionalTools { .. }));
     let tool_router = &step_context.tool_router;
-    input.push(ResponseItem::CompactionTrigger {});
-    let prompt = Prompt {
-        input,
-        tools: if tools_in_history {
-            Arc::default()
-        } else {
-            tool_router.model_visible_specs()
-        },
-        parallel_tool_calls: true,
-        base_instructions,
-        output_schema: None,
-        output_schema_strict: true,
-        cyber_access_program: turn_context.cyber_access_program,
-    };
-
     let mut responses_metadata = match captured_window {
         Some(window) => {
             sess.compaction_responses_metadata_for_window(turn_context, compaction_metadata, window)
@@ -201,42 +186,121 @@ pub(super) async fn run_remote_compact_v2_attempt(
         }
     };
     responses_metadata.tool_namespaces_info = tool_router.tool_namespaces_info().cloned();
-    let trace_attempt = compaction_trace.start_attempt(&serde_json::json!({
-        "model": model_info.slug.as_str(),
-        "instructions": prompt.base_instructions.text.as_str(),
-        "input": &prompt.input,
-        "parallel_tool_calls": prompt.parallel_tool_calls,
-    }));
-    let compaction_output_result = run_remote_compaction_request_v2(
-        sess,
-        step_context,
-        &prompt,
-        &responses_metadata,
-        transport,
-    )
-    .await;
-    trace_attempt.record_result(
-        compaction_output_result
-            .as_ref()
-            .map(|output| std::slice::from_ref(&output.compaction_output)),
-    );
-    let RemoteCompactionV2Output {
-        compaction_output,
-        response_id,
-        token_usage,
-    } = compaction_output_result?;
-    let mut prompt_input = prompt.input;
-    prompt_input.pop();
-    Ok(RemoteCompactV2Attempt {
-        input_goal_ids,
-        trace_input_history,
-        prompt_input,
-        prompt_input_metadata,
-        compaction_output,
-        compaction_response_id: response_id,
-        token_usage,
-        owned_client_session,
-    })
+    loop {
+        let (prompt_input, prompt_input_metadata): (Vec<_>, Vec<_>) =
+            if let Some(history) = foreground_history.as_ref() {
+                let (mut prompt_input, prompt_input_metadata): (Vec<_>, Vec<_>) = history
+                    .clone()
+                    .for_prompt_annotated(
+                        &model_info.input_modalities,
+                        sess.services.image_store.as_ref(),
+                    )
+                    .await
+                    .into_iter()
+                    .map(|envelope| (envelope.item, envelope.metadata))
+                    .unzip();
+                sess.services
+                    .executed_tool_calls
+                    .attach_to_compaction_prompt(&mut prompt_input);
+                (prompt_input, prompt_input_metadata)
+            } else {
+                (
+                    std::mem::take(&mut background_input),
+                    std::mem::take(&mut background_input_metadata),
+                )
+            };
+        let tools_in_history = model_info.use_responses_lite
+            && prompt_input
+                .iter()
+                .any(|item| matches!(item, ResponseItem::AdditionalTools { .. }));
+        let instructions_in_history = model_info.use_responses_lite
+            && prompt_input
+                .iter()
+                .any(|item| BaseInstructionsFragment::text_from_item(item).is_some());
+        let prompt_base_instructions = if instructions_in_history {
+            BaseInstructions {
+                text: String::new(),
+                provenance: None,
+            }
+        } else {
+            fallback_instructions.clone()
+        };
+        let mut request_input = prompt_input;
+        request_input.push(ResponseItem::CompactionTrigger {});
+        let prompt = Prompt {
+            input: request_input,
+            tools: if tools_in_history {
+                Arc::default()
+            } else {
+                tool_router.model_visible_specs()
+            },
+            parallel_tool_calls: true,
+            base_instructions: prompt_base_instructions,
+            output_schema: None,
+            output_schema_strict: true,
+            cyber_access_program: turn_context.cyber_access_program,
+        };
+        let trace_attempt = compaction_trace.start_attempt(&serde_json::json!({
+            "model": model_info.slug.as_str(),
+            "instructions": prompt.base_instructions.text.as_str(),
+            "input": &prompt.input,
+            "parallel_tool_calls": prompt.parallel_tool_calls,
+        }));
+        let compaction_output_result = run_remote_compaction_request_v2(
+            sess,
+            step_context,
+            &prompt,
+            &responses_metadata,
+            &mut transport,
+        )
+        .await;
+        trace_attempt.record_result(
+            compaction_output_result
+                .as_ref()
+                .map(|output| std::slice::from_ref(&output.compaction_output)),
+        );
+        match compaction_output_result {
+            Ok(RemoteCompactionV2Output {
+                compaction_output,
+                response_id,
+                token_usage,
+            }) => {
+                if compaction_trace.is_enabled() {
+                    trace_input_history = foreground_history
+                        .as_ref()
+                        .map(|history| history.raw_items().cloned().collect());
+                }
+                let mut prompt_input = prompt.input;
+                prompt_input.pop();
+                return Ok(RemoteCompactV2Attempt {
+                    input_goal_ids,
+                    trace_input_history,
+                    prompt_input,
+                    prompt_input_metadata,
+                    compaction_output,
+                    compaction_response_id: response_id,
+                    token_usage,
+                    owned_client_session,
+                });
+            }
+            Err(err)
+                if matches!(err.details(), CodexErrorDetails::ContextWindowExceeded)
+                    && foreground_history
+                        .as_ref()
+                        .is_some_and(|history| history.raw_items().len() > 1) =>
+            {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    error = %err,
+                    "remote compaction exceeded the context window; removing oldest history item"
+                );
+                if let Some(history) = foreground_history.as_mut() {
+                    history.remove_first_item();
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 // Defer normalization and attribution until the caller releases the session lock.
